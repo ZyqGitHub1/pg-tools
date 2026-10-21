@@ -11,16 +11,24 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// version is overridden at build time with -ldflags "-X main.version=<tag>".
+var version = "0.1.0"
+
 func main() {
 	dsn := flag.String("dsn", os.Getenv("DATABASE_URL"), "PostgreSQL connection string (default: $DATABASE_URL)")
 	dryRun := flag.Bool("dry-run", false, "run the whole chain in a transaction, then roll it back")
 	maxStatements := flag.Int("max-statements", 1000, "hard cap on executed DELETE statements, guards against foreign key cycles")
 	strategy := flag.String("strategy", "plan", "cascade strategy: plan (topological FK snapshot) or detail (parse the FK error detail, like the original TS script)")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: %s [flags] <table> <column> <value>\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+	if *showVersion {
+		fmt.Println("pg-tools " + version)
+		return
+	}
 	if flag.NArg() != 3 || *dsn == "" {
 		flag.Usage()
 		os.Exit(2)

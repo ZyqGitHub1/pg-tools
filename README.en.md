@@ -23,6 +23,8 @@ pg-tools -dsn "postgres://user:pass@localhost:5432/mydb?sslmode=disable" public.
 
 ```bash
 go build -o pg-tools .
+# Override the version (defaults to 0.1.0)
+go build -ldflags "-X main.version=0.1.0" -o pg-tools .
 ```
 
 - Go 1.27.3 (see `go.mod`, `mise.toml`)
@@ -40,6 +42,7 @@ pg-tools [flags] <table> <column> <value>
 | `-strategy` | `plan` | `plan` or `detail` |
 | `-dry-run` | `false` | Execute the whole chain, then roll back |
 | `-max-statements` | `1000` | Hard cap on DELETE statements, guards against FK cycles |
+| `-version` | - | Print the version and exit |
 
 Using the environment variable:
 

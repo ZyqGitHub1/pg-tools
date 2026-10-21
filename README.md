@@ -23,6 +23,8 @@ pg-tools -dsn "postgres://user:pass@localhost:5432/mydb?sslmode=disable" public.
 
 ```bash
 go build -o pg-tools .
+# 覆盖版本号（默认 0.1.0）
+go build -ldflags "-X main.version=0.1.0" -o pg-tools .
 ```
 
 - Go 1.27.3（见 `go.mod`、`mise.toml`）
@@ -40,6 +42,7 @@ pg-tools [flags] <table> <column> <value>
 | `-strategy` | `plan` | `plan` 或 `detail` |
 | `-dry-run` | `false` | 执行完整条链后回滚 |
 | `-max-statements` | `1000` | DELETE 语句硬上限，防止外键环路无限递归 |
+| `-version` | - | 打印版本并退出 |
 
 环境变量方式：
 
