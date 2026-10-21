@@ -127,3 +127,7 @@ cascade_test.go  集成测试（需要 PGTOOLS_TEST_DSN）
 go.mod           Go 模块与依赖
 mise.toml        固定 Go 版本
 ```
+
+## 许可证
+
+[MIT](LICENSE) © 2026 ZyqGithub1

@@ -127,3 +127,7 @@ cascade_test.go  Integration tests (require PGTOOLS_TEST_DSN)
 go.mod           Go module and dependencies
 mise.toml        Pinned Go version
 ```
+
+## License
+
+[MIT](LICENSE) © 2026 ZyqGithub1
