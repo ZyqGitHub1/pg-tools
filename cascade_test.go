@@ -23,7 +23,7 @@ func TestCascadeDelete(t *testing.T) {
 	}
 	defer conn.Close(ctx)
 
-	schema := fmt.Sprintf("pg_tools_test_%d", time.Now().UnixNano())
+	schema := fmt.Sprintf("pgtools_test_%d", time.Now().UnixNano())
 	mustExec(t, ctx, conn, "CREATE SCHEMA "+quoteIdent(schema))
 	defer conn.Exec(ctx, "DROP SCHEMA "+quoteIdent(schema)+" CASCADE")
 

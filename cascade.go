@@ -32,34 +32,46 @@ func (c *cascader) delete(ctx context.Context, table string, p pred) error {
 	}
 	c.budget--
 
-	tag, err := c.tx.Exec(ctx, "DELETE FROM "+quoteIdent(table)+" WHERE "+p.sql, p.args...)
+	// Savepoint: a failed DELETE aborts the whole tx, but we still need to query
+	// pg_constraint on it afterwards.
+	sp, err := c.tx.Begin(ctx)
 	if err != nil {
-		var pgErr *pgconn.PgError
-		if !errors.As(err, &pgErr) || pgErr.Code != fkViolation || pgErr.ConstraintName == "" {
+		return err
+	}
+	tag, err := sp.Exec(ctx, "DELETE FROM "+quoteIdent(table)+" WHERE "+p.sql, p.args...)
+	if err == nil {
+		if err := sp.Commit(ctx); err != nil {
 			return err
 		}
-		fk, fkErr := lookupFK(ctx, c.tx, pgErr)
-		if fkErr != nil {
-			return fmt.Errorf("%w (resolving constraint %s: %v)", err, pgErr.ConstraintName, fkErr)
-		}
-
-		// Delete the referencing rows of exactly the parent rows in p, then retry.
-		childPred := pred{
-			sql: "(" + quoteList(fk.childCols) + ") IN (SELECT " + quoteList(fk.parentCols) +
-				" FROM " + quoteIdent(fk.parent) + " WHERE " + p.sql + ")",
-			args: p.args,
-		}
-		fmt.Fprintf(os.Stderr, "fk %s: clearing %s before retrying %s\n", fk.constraint, fk.child, table)
-		if err := c.delete(ctx, fk.child, childPred); err != nil {
-			return err
-		}
-		return c.delete(ctx, table, p)
+		n := tag.RowsAffected()
+		c.counts[table] += n
+		fmt.Fprintf(os.Stderr, "DELETE FROM %s WHERE %s %v -> %d\n", quoteIdent(table), p.sql, p.args, n)
+		return nil
+	}
+	if err := sp.Rollback(ctx); err != nil {
+		return err
 	}
 
-	n := tag.RowsAffected()
-	c.counts[table] += n
-	fmt.Fprintf(os.Stderr, "DELETE FROM %s WHERE %s %v -> %d\n", quoteIdent(table), p.sql, p.args, n)
-	return nil
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != fkViolation || pgErr.ConstraintName == "" {
+		return err
+	}
+	fk, fkErr := lookupFK(ctx, c.tx, pgErr)
+	if fkErr != nil {
+		return fmt.Errorf("%w (resolving constraint %s: %v)", err, pgErr.ConstraintName, fkErr)
+	}
+
+	// Delete the referencing rows of exactly the parent rows in p, then retry.
+	childPred := pred{
+		sql: "(" + quoteList(fk.childCols) + ") IN (SELECT " + quoteList(fk.parentCols) +
+			" FROM " + quoteIdent(fk.parent) + " WHERE " + p.sql + ")",
+		args: p.args,
+	}
+	fmt.Fprintf(os.Stderr, "fk %s: clearing %s before retrying %s\n", fk.constraint, fk.child, table)
+	if err := c.delete(ctx, fk.child, childPred); err != nil {
+		return err
+	}
+	return c.delete(ctx, table, p)
 }
 
 type fkInfo struct {
