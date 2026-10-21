@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -13,6 +14,8 @@ import (
 )
 
 const fkViolation = "23503"
+
+var fkDetailValue = regexp.MustCompile(`=\(([^)]*)\)`)
 
 // pred is a WHERE clause with its bind parameters. Every predicate produced by
 // the planner is a copy of the same root parameters nested deeper, so the args
@@ -60,29 +63,10 @@ func (c *cascader) run(ctx context.Context, p deletePlan) error {
 }
 
 func (c *cascader) delete(ctx context.Context, table string, p pred) error {
-	if c.budget <= 0 {
-		return errors.New("statement budget exhausted, possible foreign key cycle (raise -max-statements if the data is only deep)")
-	}
-	c.budget--
-
-	// Savepoint: a failed DELETE aborts the whole tx, but we still need to run
-	// the follow-up statements on it.
-	sp, err := c.tx.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	tag, err := sp.Exec(ctx, "DELETE FROM "+quoteIdent(table)+" WHERE "+p.sql, p.args...)
+	n, err := c.tryDelete(ctx, table, p)
 	if err == nil {
-		if err := sp.Commit(ctx); err != nil {
-			return err
-		}
-		n := tag.RowsAffected()
-		c.counts[table] += n
-		fmt.Fprintf(os.Stderr, "DELETE FROM %s WHERE %s %v -> %d\n", quoteIdent(table), p.sql, p.args, n)
+		c.record(table, p, n)
 		return nil
-	}
-	if err := sp.Rollback(ctx); err != nil {
-		return err
 	}
 
 	// Row-level fallback: self-referencing trees, and anything the plan could
@@ -106,6 +90,84 @@ func (c *cascader) delete(ctx context.Context, table string, p pred) error {
 		return err
 	}
 	return c.delete(ctx, table, p)
+}
+
+// deleteByDetail reproduces cascade-delete.ts: read the referencing key value
+// out of the foreign key error's DETAIL text, delete those rows, then retry.
+//
+// Known limits of this strategy: single-column foreign keys only (a composite
+// key renders as "1, 2", which cannot be used as one value), key values
+// containing ")" get truncated by the regex, and DETAIL is human readable text
+// rather than a protocol field. -strategy plan avoids all three.
+func (c *cascader) deleteByDetail(ctx context.Context, table, column, value string) error {
+	p := pred{sql: quoteIdent(column) + " = $1", args: []any{value}}
+	n, err := c.tryDelete(ctx, table, p)
+	if err == nil {
+		c.record(table, p, n)
+		return nil
+	}
+
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != fkViolation || pgErr.ConstraintName == "" {
+		return err
+	}
+	fk, ok := c.fks[fkLookupKey(pgErr.ConstraintName, pgErr.TableName)]
+	if !ok {
+		return fmt.Errorf("%w (constraint %s not found in the startup snapshot)", err, pgErr.ConstraintName)
+	}
+	if len(fk.childCols) != 1 {
+		return fmt.Errorf("detail strategy cannot derive a value for composite foreign key %s; use -strategy plan", fk.constraint)
+	}
+	fkValue, ok := parseFKDetail(pgErr.Detail)
+	if !ok {
+		return err
+	}
+
+	fmt.Fprintf(os.Stderr, "fk %s: detail value %q, clearing %s before retrying %s\n", fk.constraint, fkValue, fk.child, table)
+	if err := c.deleteByDetail(ctx, fk.child, fk.childCols[0], fkValue); err != nil {
+		return err
+	}
+	return c.deleteByDetail(ctx, table, column, value)
+}
+
+// parseFKDetail extracts the value from a DETAIL like
+// `Key (user_id)=(42) is still referenced from table "orders".`
+func parseFKDetail(detail string) (string, bool) {
+	m := fkDetailValue.FindStringSubmatch(detail)
+	if m == nil {
+		return "", false
+	}
+	return m[1], true
+}
+
+// tryDelete runs one DELETE inside a savepoint, so a failed statement does not
+// abort the surrounding transaction.
+func (c *cascader) tryDelete(ctx context.Context, table string, p pred) (int64, error) {
+	if c.budget <= 0 {
+		return 0, errors.New("statement budget exhausted, possible foreign key cycle (raise -max-statements if the data is only deep)")
+	}
+	c.budget--
+
+	sp, err := c.tx.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	tag, err := sp.Exec(ctx, "DELETE FROM "+quoteIdent(table)+" WHERE "+p.sql, p.args...)
+	if err != nil {
+		if rbErr := sp.Rollback(ctx); rbErr != nil {
+			return 0, rbErr
+		}
+		return 0, err
+	}
+	if err := sp.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+func (c *cascader) record(table string, p pred, n int64) {
+	c.counts[table] += n
+	fmt.Fprintf(os.Stderr, "DELETE FROM %s WHERE %s %v -> %d\n", quoteIdent(table), p.sql, p.args, n)
 }
 
 // loadFKs reads the whole foreign key graph once per run.
