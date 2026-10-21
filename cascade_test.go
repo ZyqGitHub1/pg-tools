@@ -23,8 +23,7 @@ func TestCascadeDelete(t *testing.T) {
 	}
 	defer conn.Close(ctx)
 
-	schema := fmt.Sprintf("pgtools_test_%d", time.Now().UnixNano())
-	mustExec(t, ctx, conn, "CREATE SCHEMA "+quoteIdent(schema))
+	schema := newTestSchema(t, ctx, conn)
 	defer conn.Exec(ctx, "DROP SCHEMA "+quoteIdent(schema)+" CASCADE")
 
 	mustExec(t, ctx, conn, `
@@ -63,6 +62,83 @@ INSERT INTO `+schema+`.pair_refs VALUES (1, 1), (1, 2), (2, 1);
 	}
 	assertCount(t, ctx, conn, schema+".pairs", 1)
 	assertCount(t, ctx, conn, schema+".pair_refs", 1)
+}
+
+// Covers the topo-planned paths: self-referencing tree, CASCADE chain with a
+// NO ACTION grandchild, SET NULL, and a multi-table cycle.
+func TestCascadePlan(t *testing.T) {
+	dsn := os.Getenv("PGTOOLS_TEST_DSN")
+	if dsn == "" {
+		t.Skip("PGTOOLS_TEST_DSN not set")
+	}
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+
+	schema := newTestSchema(t, ctx, conn)
+	defer conn.Exec(ctx, "DROP SCHEMA "+quoteIdent(schema)+" CASCADE")
+
+	mustExec(t, ctx, conn, `
+CREATE TABLE `+schema+`.categories (id int PRIMARY KEY, parent_id int REFERENCES `+schema+`.categories(id));
+CREATE TABLE `+schema+`.products (id int PRIMARY KEY, category_id int REFERENCES `+schema+`.categories(id));
+CREATE TABLE `+schema+`.a (id int PRIMARY KEY);
+CREATE TABLE `+schema+`.b (id int PRIMARY KEY, a_id int REFERENCES `+schema+`.a(id) ON DELETE CASCADE);
+CREATE TABLE `+schema+`.c (id int PRIMARY KEY, b_id int REFERENCES `+schema+`.b(id));
+CREATE TABLE `+schema+`.p (id int PRIMARY KEY);
+CREATE TABLE `+schema+`.s (id int PRIMARY KEY, p_id int REFERENCES `+schema+`.p(id) ON DELETE SET NULL);
+CREATE TABLE `+schema+`.cyc_a (id int PRIMARY KEY, b_id int);
+CREATE TABLE `+schema+`.cyc_b (id int PRIMARY KEY, a_id int REFERENCES `+schema+`.cyc_a(id));
+ALTER TABLE `+schema+`.cyc_a ADD FOREIGN KEY (b_id) REFERENCES `+schema+`.cyc_b(id);
+INSERT INTO `+schema+`.categories VALUES (1, NULL), (2, 1), (3, 2);
+INSERT INTO `+schema+`.products VALUES (10, 2), (11, 3);
+INSERT INTO `+schema+`.a VALUES (1);
+INSERT INTO `+schema+`.b VALUES (1, 1);
+INSERT INTO `+schema+`.c VALUES (1, 1);
+INSERT INTO `+schema+`.p VALUES (1);
+INSERT INTO `+schema+`.s VALUES (1, 1);
+INSERT INTO `+schema+`.cyc_a VALUES (1, NULL);
+INSERT INTO `+schema+`.cyc_b VALUES (1, 1);
+UPDATE `+schema+`.cyc_a SET b_id = 1;
+`)
+
+	// Self reference plus an external table pointing at a descendant.
+	if err := run(ctx, dsn, schema+".categories", "id", "1", false, 1000); err != nil {
+		t.Fatalf("tree cascade: %v", err)
+	}
+	assertCount(t, ctx, conn, schema+".categories", 0)
+	assertCount(t, ctx, conn, schema+".products", 0)
+
+	// CASCADE edge leads to a table with a NO ACTION child.
+	if err := run(ctx, dsn, schema+".a", "id", "1", false, 1000); err != nil {
+		t.Fatalf("cascade chain: %v", err)
+	}
+	assertCount(t, ctx, conn, schema+".a", 0)
+	assertCount(t, ctx, conn, schema+".b", 0)
+	assertCount(t, ctx, conn, schema+".c", 0)
+
+	// SET NULL leaves the child row alive.
+	if err := run(ctx, dsn, schema+".p", "id", "1", false, 1000); err != nil {
+		t.Fatalf("set null: %v", err)
+	}
+	assertCount(t, ctx, conn, schema+".p", 0)
+	assertCount(t, ctx, conn, schema+".s WHERE p_id IS NULL", 1)
+
+	// Mutual foreign keys cannot be ordered; refuse before touching data.
+	if err := run(ctx, dsn, schema+".cyc_a", "id", "1", false, 1000); err == nil {
+		t.Fatal("cycle: expected an error")
+	}
+	assertCount(t, ctx, conn, schema+".cyc_a", 1)
+	assertCount(t, ctx, conn, schema+".cyc_b", 1)
+}
+
+func newTestSchema(t *testing.T, ctx context.Context, conn *pgx.Conn) string {
+	t.Helper()
+	schema := fmt.Sprintf("pgtools_test_%d", time.Now().UnixNano())
+	mustExec(t, ctx, conn, "CREATE SCHEMA "+quoteIdent(schema))
+	return schema
 }
 
 func mustExec(t *testing.T, ctx context.Context, conn *pgx.Conn, sql string) {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -44,8 +45,18 @@ func run(ctx context.Context, dsn, table, column, value string, dryRun bool, max
 	}
 	defer tx.Rollback(ctx) // no-op once committed
 
-	c := &cascader{tx: tx, budget: maxStatements, counts: map[string]int64{}}
-	if err := c.delete(ctx, table, pred{sql: quoteIdent(column) + " = $1", args: []any{value}}); err != nil {
+	edges, index, err := loadFKs(ctx, tx)
+	if err != nil {
+		return err
+	}
+	p, err := buildPlan(table, column, value, edges)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "delete order: %s\n", strings.Join(p.order, ", "))
+
+	c := &cascader{tx: tx, budget: maxStatements, counts: map[string]int64{}, fks: index}
+	if err := c.run(ctx, p); err != nil {
 		return err
 	}
 
